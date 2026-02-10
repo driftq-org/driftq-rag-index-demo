@@ -1,6 +1,4 @@
-SHELL := /bin/bash
-
-.PHONY: up down logs demo
+.PHONY: up down logs demo demo-clean
 
 up:
 	docker compose up -d --build
@@ -12,4 +10,8 @@ logs:
 	docker compose logs -f --tail=200
 
 demo:
-	bash scripts/demo.sh
+	docker compose up --build --abort-on-container-exit --exit-code-from demo demo
+
+demo-clean:
+	docker compose up --build --abort-on-container-exit --exit-code-from demo demo
+	docker compose down -v
