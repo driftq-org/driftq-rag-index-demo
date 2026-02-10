@@ -1,0 +1,51 @@
+services:
+  driftq:
+    image: ${DRIFTQ_IMAGE:-ghcr.io/driftq-org/driftq-core:latest}
+    ports:
+      - "8080:8080"
+    volumes:
+      - driftq_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  api:
+    build: ./api
+    environment:
+      - DRIFTQ_HTTP_URL=http://driftq:8080/v1
+      - QDRANT_URL=http://qdrant:6333
+      - DEMO_INDEX_NAME=${DEMO_INDEX_NAME:-demo}
+      - DEMO_DATASET=${DEMO_DATASET:-sample}
+      - EMBED_DIM=${EMBED_DIM:-16}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - driftq
+      - qdrant
+    volumes:
+      - demo_state:/state
+      - ./data:/data:ro
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  worker:
+    build: ./api
+    environment:
+      - DRIFTQ_HTTP_URL=http://driftq:8080/v1
+      - QDRANT_URL=http://qdrant:6333
+      - EMBED_DIM=${EMBED_DIM:-16}
+    depends_on:
+      - driftq
+      - qdrant
+    volumes:
+      - demo_state:/state
+      - ./data:/data:ro
+    command: ["python", "-m", "app.worker"]
+
+volumes:
+  driftq_data:
+  qdrant_data:
+  demo_state:
