@@ -14,6 +14,10 @@ class QdrantHTTP:
             r = await c.get(f"{self.base_url}/readyz")
             return r.status_code == 200
 
+    async def readyz(self) -> bool:
+        # Alias so callers can use readyz() or ready()
+        return await self.ready()
+
     async def create_collection(self, name: str, *, vector_size: int, distance: str = "Cosine") -> None:
         body = {"vectors": {"size": vector_size, "distance": distance}}
         async with httpx.AsyncClient(timeout=10.0) as c:

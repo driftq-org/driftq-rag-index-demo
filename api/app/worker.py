@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, Callable, Awaitable, Optional
+from typing import Any, Dict
 
 from .driftq_client import DriftQClient
 from .pipeline import discover_step, chunk_step, embed_step, should_fail
@@ -21,12 +21,11 @@ from .storage import (
     get_history,
 )
 
-logger = logging.getLogger("demo.worker")
-logging.basicConfig(level=logging.INFO)
-
 BUILD_TOPIC = "demo.rag.build"
 CONTROL_TOPIC = "demo.rag.control"
 WORKER_GROUP = "demo-rag-worker"
+
+logger = logging.getLogger("demo.worker")
 
 
 def collection_name(index: str, version: int) -> str:
@@ -47,7 +46,6 @@ async def handle_build(q: QdrantHTTP, msg_value: Dict[str, Any]) -> None:
     fail_mode = msg_value.get("fail_mode", "never")
     dim = int(os.getenv("EMBED_DIM", "16"))
 
-    # initialize state if not exists
     state = get_run_state(run_id)
     if state.get("status") in ("UNKNOWN", "QUEUED"):
         init_run_state(
@@ -124,7 +122,6 @@ async def handle_build(q: QdrantHTTP, msg_value: Dict[str, Any]) -> None:
 
             embeds_path = run_dir(run_id) / "embeddings.json"
             embeds = __import__("json").loads(embeds_path.read_text(encoding="utf-8"))
-
             points = []
             for e in embeds:
                 pid = int(__import__("hashlib").sha256(e["chunk_id"].encode("utf-8")).hexdigest()[:16], 16)
@@ -203,42 +200,39 @@ async def handle_build(q: QdrantHTTP, msg_value: Dict[str, Any]) -> None:
             st["errors"].append({"step": "runtime", "error": str(e)})
             set_run_state(run_id, st)
         append_log(run_id, f"Run FAILED: {e}")
-        logger.exception("run failed run_id=%s", run_id)
-        return
+        logger.exception("build failed run_id=%s", run_id)
 
 
 async def handle_rollback(q: QdrantHTTP, msg_value: Dict[str, Any]) -> Dict[str, Any]:
     index = msg_value.get("index", "demo")
     steps = int(msg_value.get("steps") or 1)
     to_version = msg_value.get("to_version")
-
     hist = get_history(index)
     active = hist.get("active")
     if active is None:
         return {"ok": False, "error": "no active version"}
-
     if to_version is None:
         to_version = previous_version(index, steps=steps)
     if to_version is None:
         return {"ok": False, "error": "no previous version available"}
-
     coll = collection_name(index, int(to_version))
     await q.set_alias(alias_name(index), coll)
     set_active(index, int(to_version))
     return {"ok": True, "index": index, "active": int(to_version), "collection": coll}
 
 
-async def consume_loop(topic: str, handler: Callable[[QdrantHTTP, Dict[str, Any]], Awaitable[Any]]) -> None:
+async def consume_loop(topic: str, handler):
     driftq = DriftQClient()
     q = QdrantHTTP()
 
     backoff = 1.0
+    max_backoff = 10.0
+
+    await driftq.ensure_topic(topic, partitions=1)
+    logger.info("consuming topic=%s group=%s owner=%s", topic, WORKER_GROUP, driftq.owner)
+
     while True:
         try:
-            await driftq.ensure_topic(topic, partitions=1)
-            logger.info("ensured topic=%s partitions=1", topic)
-
-            backoff = 1.0  # reset on successful connect
             async for msg in driftq.consume_stream(topic=topic, group=WORKER_GROUP, lease_ms=30_000):
                 val = driftq.extract_value(msg) or {}
                 try:
@@ -249,18 +243,26 @@ async def consume_loop(topic: str, handler: Callable[[QdrantHTTP, Dict[str, Any]
 
                     await driftq.ack(topic=topic, group=WORKER_GROUP, msg=msg)
                 except Exception:
-                    logger.exception("handler failed topic=%s msg=%s", topic, str(msg)[:500])
+                    logger.exception("handler failed; nacking topic=%s lease_id=%s", topic, msg.get("lease_id"))
                     try:
                         await driftq.nack(topic=topic, group=WORKER_GROUP, msg=msg)
                     except Exception:
-                        logger.exception("nack failed topic=%s", topic)
+                        logger.exception("nack failed topic=%s lease_id=%s", topic, msg.get("lease_id"))
+
+            # If the stream ends naturally, reset backoff and reconnect.
+            backoff = 1.0
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            logger.exception("consume loop crashed topic=%s (will retry)", topic)
+            logger.exception("consume loop crashed topic=%s (will retry in %.1fs)", topic, backoff)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 15.0)
+            backoff = min(max_backoff, backoff * 2.0)
 
 
-async def main() -> None:
+async def main():
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
     logger.info("worker starting...")
     await asyncio.gather(
         consume_loop(BUILD_TOPIC, handler=handle_rollback),

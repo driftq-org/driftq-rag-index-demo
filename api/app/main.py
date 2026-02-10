@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import uuid
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -19,9 +17,6 @@ from .storage import (
     set_run_state,
 )
 
-logger = logging.getLogger("demo.api")
-logging.basicConfig(level=logging.INFO)
-
 BUILD_TOPIC = "demo.rag.build"
 CONTROL_TOPIC = "demo.rag.control"
 
@@ -30,14 +25,12 @@ app = FastAPI(title="driftq-rag-index-demo", version="0.1.0")
 
 async def _startup_retry(fn, seconds: int = 60):
     start = asyncio.get_event_loop().time()
-    last_err: Exception | None = None
     while True:
         try:
             return await fn()
-        except Exception as e:
-            last_err = e
+        except Exception:
             if asyncio.get_event_loop().time() - start > seconds:
-                raise last_err
+                raise
             await asyncio.sleep(1)
 
 
@@ -46,9 +39,8 @@ async def startup():
     driftq = DriftQClient()
 
     async def ensure():
-        r1 = await driftq.ensure_topic(BUILD_TOPIC, partitions=1)
-        r2 = await driftq.ensure_topic(CONTROL_TOPIC, partitions=1)
-        logger.info("ensured topics: build=%s control=%s", r1.get("status", "ok"), r2.get("status", "ok"))
+        await driftq.ensure_topic(BUILD_TOPIC, partitions=1)
+        await driftq.ensure_topic(CONTROL_TOPIC, partitions=1)
 
     await _startup_retry(ensure, seconds=60)
 
@@ -58,12 +50,18 @@ async def healthz():
     driftq = DriftQClient()
     q = QdrantHTTP()
 
-    driftq_ok = await driftq.healthz()
+    driftq_ok = False
     q_ok = False
+
     try:
-        q_ok = await q.readyz()
-    except Exception as e:
-        logger.warning("qdrant readyz error: %s", e)
+        driftq_ok = await driftq.healthz()
+    except Exception:
+        driftq_ok = False
+
+    # ✅ IMPORTANT: QdrantHTTP implements ready() (and we also add readyz() alias below)
+    try:
+        q_ok = await q.ready()
+    except Exception:
         q_ok = False
 
     if driftq_ok and q_ok:
@@ -92,9 +90,13 @@ async def demo_build(req: BuildRequest):
             fail_mode=req.fail_mode,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "state_init_failed", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "state_init_failed", "message": str(e)},
+        )
 
     driftq = DriftQClient()
+
     payload = {
         "run_id": run_id,
         "index": index,
@@ -105,20 +107,22 @@ async def demo_build(req: BuildRequest):
     }
 
     try:
+        # keep your current signature usage
         await driftq.produce(topic=BUILD_TOPIC, value=payload, idempotency_key=run_id)
     except Exception as e:
-        # mark run failed so UI/demo can show it
         try:
             append_log(run_id, f"ERROR: enqueue failed: {e}")
             st = get_run_state(run_id)
             st["status"] = "FAILED"
-            st["errors"] = st.get("errors", [])
-            st["errors"].append({"step": "enqueue", "error": str(e)})
+            st["error"] = f"enqueue_failed: {e}"
             set_run_state(run_id, st)
         except Exception:
             pass
 
-        raise HTTPException(status_code=502, detail={"error": "enqueue_failed", "message": str(e)})
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "enqueue_failed", "message": str(e)},
+        )
 
     return EnqueueResponse(run_id=run_id, queued=True, topic=BUILD_TOPIC)
 
