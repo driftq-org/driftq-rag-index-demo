@@ -47,11 +47,16 @@ async def handle_build(q: QdrantHTTP, msg_value: Dict[str, Any]) -> None:
     dataset = msg_value.get("dataset", "sample")
     version = int(msg_value.get("version") or next_version(index))
     from_step = msg_value.get("from_step")  # optional
+    is_replay = msg_value.get("type") == "replay" or from_step is not None
     fail_step = msg_value.get("fail_step", "none")
     fail_mode = msg_value.get("fail_mode", "never")
     dim = int(os.getenv("EMBED_DIM", "16"))
 
     state = get_run_state(run_id)
+    if state.get("status") == "FAILED" and not is_replay:
+        append_log(run_id, "Run already FAILED; skipping duplicate build message (not a replay)")
+        return
+
     if state.get("status") in ("UNKNOWN", "QUEUED"):
         init_run_state(
             run_id=run_id,
@@ -62,6 +67,10 @@ async def handle_build(q: QdrantHTTP, msg_value: Dict[str, Any]) -> None:
             fail_mode=fail_mode,
         )
         state = get_run_state(run_id)
+
+    if is_replay:
+        # Clear prior errors so final status isn't mixed success+error.
+        state["errors"] = []
 
     state["status"] = "RUNNING"
     set_run_state(run_id, state)

@@ -177,9 +177,14 @@ async def demo_index(index: str):
     q = QdrantHTTP()
     alias = f"demo_{index}_active"
     target = None
-    try:
-        target = await q.get_alias_target(alias)
-    except Exception:
-        target = None
+    for attempt in range(3):
+        try:
+            target = await q.get_alias_target(alias)
+            if target:
+                break
+        except Exception:
+            target = None
+        if attempt < 2:
+            await asyncio.sleep(0.25)
     hist = get_history(index)
     return {"index": index, "alias": alias, "alias_target": target, "history": hist}
