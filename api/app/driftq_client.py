@@ -4,12 +4,13 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional, Union
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
+JsonLike = Union[Dict[str, Any], list, str, int, float, bool, None]
 
 class DriftQClient:
     """
@@ -24,7 +25,12 @@ class DriftQClient:
         self.base_url = (base_url or os.getenv("DRIFTQ_HTTP_URL", "http://driftq:8080/v1")).rstrip("/")
         self.timeout = httpx.Timeout(10.0)
         # DriftQ v1 consume requires an "owner" (lease owner). Keep it stable per process.
-        self.owner = owner or os.getenv("DRIFTQ_OWNER") or uuid.uuid4().hex[:12]
+        self.owner = (
+            owner
+            or os.getenv("DRIFTQ_OWNER")
+            or os.getenv("HOSTNAME")
+            or uuid.uuid4().hex[:12]
+        )
 
     def _is_ok(self, status_code: int) -> bool:
         return 200 <= status_code < 300
@@ -87,7 +93,7 @@ class DriftQClient:
         self,
         *,
         topic: str,
-        value: Dict[str, Any],
+        value: JsonLike,
         idempotency_key: Optional[str] = None,
         tenant_id: Optional[str] = None,
         envelope: Optional[Dict[str, Any]] = None,
@@ -106,7 +112,6 @@ class DriftQClient:
         payload_a: Dict[str, Any] = {"topic": topic, "value": value_str}
         if idempotency_key:
             payload_a["idempotency_key"] = idempotency_key
-            payload_a["idem_key"] = idempotency_key  # alias some servers accept
         if tenant_id:
             payload_a["tenant_id"] = tenant_id
             payload_a["tenant"] = tenant_id  # alias
@@ -121,7 +126,6 @@ class DriftQClient:
             env.update(envelope)
         if idempotency_key:
             env["idempotency_key"] = idempotency_key
-            env["idem_key"] = idempotency_key
         if tenant_id:
             env["tenant_id"] = tenant_id
             env["tenant"] = tenant_id
@@ -203,11 +207,24 @@ class DriftQClient:
 
     async def _ack_like(self, url: str, *, topic: str, group: str, msg: Dict[str, Any], owner: Optional[str]) -> None:
         # Try lease_id style first (older servers)
-        lease_id = msg.get("lease_id")
-        # Some servers might embed lease info under "lease"
+        lease_id = msg.get("lease_id") or msg.get("leaseId")
         lease = msg.get("lease")
         if isinstance(lease, dict) and not lease_id:
-            lease_id = lease.get("lease_id")
+            lease_id = lease.get("lease_id") or lease.get("leaseId") or lease.get("lease")
+
+        # Newer shapes may tuck lease info in envelope/routing
+        for parent_key in ("envelope", "routing"):
+            parent = msg.get(parent_key)
+            if isinstance(parent, dict) and not lease_id:
+                lease_id = parent.get("lease_id") or parent.get("leaseId") or parent.get("lease")
+                if not lease_id:
+                    embedded = parent.get("lease")
+                    if isinstance(embedded, dict):
+                        lease_id = (
+                            embedded.get("lease_id")
+                            or embedded.get("leaseId")
+                            or embedded.get("lease")
+                        )
 
         # Try offset style (your current server)
         partition = msg.get("partition")
@@ -219,6 +236,7 @@ class DriftQClient:
 
         if lease_id:
             payloads.append({"topic": topic, "group": group, "lease_id": lease_id})
+            payloads.append({"topic": topic, "group": group, "lease": lease_id})
 
         if partition is not None and offset is not None:
             payloads.append(

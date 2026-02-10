@@ -251,11 +251,34 @@ async def consume_loop(topic: str, handler):
                     consecutive_failures = 0
 
                 except Exception:
-                    logger.exception("handler failed; nacking topic=%s", topic)
+                    lease_dbg = (
+                        msg.get("lease_id")
+                        or msg.get("leaseId")
+                        or msg.get("lease")
+                        or (msg.get("envelope") or {}).get("lease_id")
+                        or (msg.get("envelope") or {}).get("leaseId")
+                        or (msg.get("envelope") or {}).get("lease")
+                        or (msg.get("routing") or {}).get("lease_id")
+                        or (msg.get("routing") or {}).get("leaseId")
+                        or (msg.get("routing") or {}).get("lease")
+                    )
+                    logger.exception(
+                        "handler failed; nacking topic=%s lease=%s partition=%s offset=%s",
+                        topic,
+                        lease_dbg,
+                        msg.get("partition"),
+                        msg.get("offset"),
+                    )
                     try:
                         await driftq.nack(topic=topic, group=WORKER_GROUP, msg=msg, owner=OWNER)
                     except Exception:
-                        logger.exception("nack failed (will redeliver anyway)")
+                        logger.exception(
+                            "nack failed (will redeliver anyway) topic=%s lease=%s partition=%s offset=%s",
+                            topic,
+                            lease_dbg,
+                            msg.get("partition"),
+                            msg.get("offset"),
+                        )
 
         except Exception:
             consecutive_failures += 1
