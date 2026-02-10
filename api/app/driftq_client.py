@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import socket
-from typing import Any, AsyncIterator, Dict, Optional, Union
+import uuid
+from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
 
@@ -19,14 +19,14 @@ class DriftQClient:
       - Worker (ensure_topic, consume_stream, ack/nack)
     """
 
-    def __init__(self, base_url: Optional[str] = None, owner: Optional[str] = None) -> None:
+    def __init__(self, base_url: Optional[str] = None, *, owner: Optional[str] = None) -> None:
         # Expect DRIFTQ_HTTP_URL like: http://driftq:8080/v1
         self.base_url = (base_url or os.getenv("DRIFTQ_HTTP_URL", "http://driftq:8080/v1")).rstrip("/")
         self.timeout = httpx.Timeout(10.0)
-        # DriftQ consume requires an owner (per your 400 error). Use stable hostname by default.
-        self.owner = owner or os.getenv("DRIFTQ_OWNER") or socket.gethostname()
+        # DriftQ v1 consume requires an "owner" (lease owner). Keep it stable per process.
+        self.owner = owner or os.getenv("DRIFTQ_OWNER") or uuid.uuid4().hex[:12]
 
-    def _is_healthy_status(self, status_code: int) -> bool:
+    def _is_ok(self, status_code: int) -> bool:
         return 200 <= status_code < 300
 
     async def healthz(self) -> bool:
@@ -34,7 +34,7 @@ class DriftQClient:
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 r = await client.get(url)
-            ok = self._is_healthy_status(r.status_code)
+            ok = self._is_ok(r.status_code)
             if not ok:
                 logger.warning("driftq healthz unhealthy: %s %s", r.status_code, r.text[:500])
             return ok
@@ -46,8 +46,8 @@ class DriftQClient:
         """
         Create topic if missing.
 
-        Your server clearly accepts {"topic": "..."} (and sometimes rejects {"name": "..."} with 400),
-        so we try "topic" first to avoid noisy 400 logs, then fall back to "name".
+        Your DriftQ container is accepting one payload shape and rejecting another (400 then 201).
+        So: try {"topic": "..."} first, then fallback to {"name": "..."}.
         """
         url = f"{self.base_url}/topics"
 
@@ -65,7 +65,7 @@ class DriftQClient:
             r = await _post(p)
             last = r
 
-            # Success OR already-exists
+            # success / already exists
             if r.status_code in (200, 201, 204, 409):
                 if not r.content:
                     return {"status": "ok"}
@@ -74,7 +74,7 @@ class DriftQClient:
                 except Exception:
                     return {"status": "ok", "raw": r.text}
 
-            # bad payload shape, try fallback
+            # try next payload shape if it's a payload validation problem
             if r.status_code in (400, 422):
                 continue
 
@@ -87,59 +87,83 @@ class DriftQClient:
         self,
         *,
         topic: str,
-        value: Union[Dict[str, Any], str],
-        envelope: Optional[Dict[str, Any]] = None,
+        value: Dict[str, Any],
         idempotency_key: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        envelope: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        IMPORTANT: DriftQ expects `value` to be a STRING (your error confirms this).
-        So if caller passes a dict, we JSON-encode it into a string.
+        IMPORTANT (based on your error): DriftQ expects ProduceRequest.value to be a STRING.
+        So we JSON-encode dict values.
         """
         url = f"{self.base_url}/produce"
+        value_str = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
-        if isinstance(value, str):
-            value_str = value
-        else:
-            value_str = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        # We attempt a couple request shapes because DriftQ servers vary.
+        attempts: list[Dict[str, Any]] = []
 
+        # Shape A: top-level fields
+        payload_a: Dict[str, Any] = {"topic": topic, "value": value_str}
+        if idempotency_key:
+            payload_a["idempotency_key"] = idempotency_key
+            payload_a["idem_key"] = idempotency_key  # alias some servers accept
+        if tenant_id:
+            payload_a["tenant_id"] = tenant_id
+            payload_a["tenant"] = tenant_id  # alias
+        if envelope:
+            payload_a["envelope"] = envelope
+        attempts.append(payload_a)
+
+        # Shape B: everything inside envelope (some servers prefer this)
+        payload_b: Dict[str, Any] = {"topic": topic, "value": value_str}
         env: Dict[str, Any] = {}
         if envelope:
             env.update(envelope)
         if idempotency_key:
-            # The server supports envelope idempotency_key; keep it here.
             env["idempotency_key"] = idempotency_key
+            env["idem_key"] = idempotency_key
         if tenant_id:
             env["tenant_id"] = tenant_id
-
-        payload: Dict[str, Any] = {"topic": topic, "value": value_str}
+            env["tenant"] = tenant_id
         if env:
-            payload["envelope"] = env
+            payload_b["envelope"] = env
+        attempts.append(payload_b)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(url, json=payload)
+        last: Optional[httpx.Response] = None
+        for payload in attempts:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(url, json=payload)
+            last = r
 
-        if not self._is_healthy_status(r.status_code):
+            if self._is_ok(r.status_code):
+                if not r.content:
+                    return {"status": "ok"}
+                try:
+                    return r.json()
+                except Exception:
+                    return {"status": "ok", "raw": r.text}
+
+            # If server says our JSON shape is wrong, try the next shape.
+            if r.status_code in (400, 422):
+                continue
+
             raise RuntimeError(f"produce failed: {r.status_code} {r.text}")
 
-        if not r.content:
-            return {"status": "ok"}
-        try:
-            return r.json()
-        except Exception:
-            return {"status": "ok", "raw": r.text}
+        assert last is not None
+        raise RuntimeError(f"produce failed: {last.status_code} {last.text}")
 
     async def consume_stream(
         self,
         *,
         topic: str,
         group: str,
-        lease_ms: int = 30_000,
         owner: Optional[str] = None,
+        lease_ms: int = 30_000,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Stream messages as NDJSON from DriftQ.
-        Your server requires topic, group, and owner.
+
+        Your DriftQ requires: topic, group, owner
         """
         url = f"{self.base_url}/consume"
         params = {
@@ -151,7 +175,7 @@ class DriftQClient:
 
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("GET", url, params=params) as r:
-                if not self._is_healthy_status(r.status_code):
+                if not self._is_ok(r.status_code):
                     body = (await r.aread()).decode("utf-8", errors="replace")
                     raise RuntimeError(f"consume failed: {r.status_code} {body}")
 
@@ -165,52 +189,82 @@ class DriftQClient:
                         logger.warning("bad json line from consume: %r", line[:500])
 
     async def ack(self, *, topic: str, group: str, msg: Dict[str, Any], owner: Optional[str] = None) -> None:
+        """
+        Your server is NOT lease_id-based (it errors on 'lease_id').
+        It appears offset-based: owner + partition + offset.
+        We'll support both formats.
+        """
         url = f"{self.base_url}/ack"
-        payload = {
-            "topic": topic,
-            "group": group,
-            "lease_id": msg.get("lease_id"),
-            "owner": owner or self.owner,
-        }
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(url, json=payload)
-
-        if not self._is_healthy_status(r.status_code):
-            raise RuntimeError(f"ack failed: {r.status_code} {r.text}")
+        await self._ack_like(url, topic=topic, group=group, msg=msg, owner=owner)
 
     async def nack(self, *, topic: str, group: str, msg: Dict[str, Any], owner: Optional[str] = None) -> None:
         url = f"{self.base_url}/nack"
-        payload = {
-            "topic": topic,
-            "group": group,
-            "lease_id": msg.get("lease_id"),
-            "owner": owner or self.owner,
-        }
+        await self._ack_like(url, topic=topic, group=group, msg=msg, owner=owner)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(url, json=payload)
+    async def _ack_like(self, url: str, *, topic: str, group: str, msg: Dict[str, Any], owner: Optional[str]) -> None:
+        # Try lease_id style first (older servers)
+        lease_id = msg.get("lease_id")
+        # Some servers might embed lease info under "lease"
+        lease = msg.get("lease")
+        if isinstance(lease, dict) and not lease_id:
+            lease_id = lease.get("lease_id")
 
-        if not self._is_healthy_status(r.status_code):
-            raise RuntimeError(f"nack failed: {r.status_code} {r.text}")
+        # Try offset style (your current server)
+        partition = msg.get("partition")
+        offset = msg.get("offset")
+        if offset is None:
+            offset = msg.get("Offset")  # just in case
+
+        payloads: list[Dict[str, Any]] = []
+
+        if lease_id:
+            payloads.append({"topic": topic, "group": group, "lease_id": lease_id})
+
+        if partition is not None and offset is not None:
+            payloads.append(
+                {
+                    "topic": topic,
+                    "group": group,
+                    "owner": owner or self.owner,
+                    "partition": partition,
+                    "offset": offset,
+                }
+            )
+
+        if not payloads:
+            raise RuntimeError(f"ack/nack: missing lease_id OR (partition+offset) in message keys={list(msg.keys())}")
+
+        last: Optional[httpx.Response] = None
+        for payload in payloads:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(url, json=payload)
+            last = r
+
+            if self._is_ok(r.status_code):
+                return
+
+            # payload mismatch? try next shape
+            if r.status_code in (400, 422):
+                continue
+
+            raise RuntimeError(f"ack/nack failed: {r.status_code} {r.text}")
+
+        assert last is not None
+        raise RuntimeError(f"ack/nack failed: {last.status_code} {last.text}")
 
     def extract_value(self, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Worker helper: messages are typically {"value": "...", "lease_id": "...", ...}
-
-        Since DriftQ stores value as STRING, we decode JSON string back into dict.
+        Worker helper:
+          - server may return value as dict OR as a JSON string
         """
         v = msg.get("value")
         if isinstance(v, dict):
             return v
         if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                return None
             try:
-                parsed = json.loads(s)
-                return parsed if isinstance(parsed, dict) else {"_value": parsed}
+                parsed = json.loads(v)
+                if isinstance(parsed, dict):
+                    return parsed
             except Exception:
-                # Not JSON — still return something so handler can log/debug.
-                return {"_raw": v}
+                return None
         return None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from typing import Any, Dict
 
 from .driftq_client import DriftQClient
@@ -25,7 +26,11 @@ BUILD_TOPIC = "demo.rag.build"
 CONTROL_TOPIC = "demo.rag.control"
 WORKER_GROUP = "demo-rag-worker"
 
+# IMPORTANT: DriftQ requires an "owner" for consume + ack/nack (your server does).
+OWNER = os.getenv("DRIFTQ_OWNER") or uuid.uuid4().hex[:12]
+
 logger = logging.getLogger("demo.worker")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 def collection_name(index: str, version: int) -> str:
@@ -200,7 +205,7 @@ async def handle_build(q: QdrantHTTP, msg_value: Dict[str, Any]) -> None:
             st["errors"].append({"step": "runtime", "error": str(e)})
             set_run_state(run_id, st)
         append_log(run_id, f"Run FAILED: {e}")
-        logger.exception("build failed run_id=%s", run_id)
+        raise
 
 
 async def handle_rollback(q: QdrantHTTP, msg_value: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,47 +227,46 @@ async def handle_rollback(q: QdrantHTTP, msg_value: Dict[str, Any]) -> Dict[str,
 
 
 async def consume_loop(topic: str, handler):
-    driftq = DriftQClient()
+    driftq = DriftQClient(owner=OWNER)
     q = QdrantHTTP()
 
-    backoff = 1.0
-    max_backoff = 10.0
-
     await driftq.ensure_topic(topic, partitions=1)
-    logger.info("consuming topic=%s group=%s owner=%s", topic, WORKER_GROUP, driftq.owner)
+
+    consecutive_failures = 0
 
     while True:
         try:
-            async for msg in driftq.consume_stream(topic=topic, group=WORKER_GROUP, lease_ms=30_000):
+            logger.info("consuming topic=%s group=%s owner=%s", topic, WORKER_GROUP, OWNER)
+
+            async for msg in driftq.consume_stream(topic=topic, group=WORKER_GROUP, owner=OWNER, lease_ms=30_000):
                 val = driftq.extract_value(msg) or {}
+
                 try:
                     if topic == BUILD_TOPIC:
                         await handle_build(q, val)
                     else:
                         await handler(q, val)
 
-                    await driftq.ack(topic=topic, group=WORKER_GROUP, msg=msg)
-                except Exception:
-                    logger.exception("handler failed; nacking topic=%s lease_id=%s", topic, msg.get("lease_id"))
-                    try:
-                        await driftq.nack(topic=topic, group=WORKER_GROUP, msg=msg)
-                    except Exception:
-                        logger.exception("nack failed topic=%s lease_id=%s", topic, msg.get("lease_id"))
+                    await driftq.ack(topic=topic, group=WORKER_GROUP, msg=msg, owner=OWNER)
+                    consecutive_failures = 0
 
-            # If the stream ends naturally, reset backoff and reconnect.
-            backoff = 1.0
-        except asyncio.CancelledError:
-            raise
+                except Exception:
+                    logger.exception("handler failed; nacking topic=%s", topic)
+                    try:
+                        await driftq.nack(topic=topic, group=WORKER_GROUP, msg=msg, owner=OWNER)
+                    except Exception:
+                        logger.exception("nack failed (will redeliver anyway)")
+
         except Exception:
-            logger.exception("consume loop crashed topic=%s (will retry in %.1fs)", topic, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(max_backoff, backoff * 2.0)
+            consecutive_failures += 1
+            logger.exception("consume loop crashed topic=%s (will retry). failures=%d", topic, consecutive_failures)
+            # Don’t die silently: if we keep crashing, exit so Docker restarts us.
+            if consecutive_failures >= 10:
+                raise
+            await asyncio.sleep(1.0)
 
 
 async def main():
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
-
     logger.info("worker starting...")
     await asyncio.gather(
         consume_loop(BUILD_TOPIC, handler=handle_rollback),
