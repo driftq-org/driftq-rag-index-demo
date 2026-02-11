@@ -1,4 +1,4 @@
-# driftq-rag-index-demo
+Ôªø# driftq-rag-index-demo
 
 This repo is a small, production-minded demo that shows how to:
 - use DriftQ-Core (via Docker) as a task queue + redelivery engine
@@ -15,13 +15,17 @@ It is designed to be easy to run locally. You do not need local Python or jq. Th
 - A Qdrant vector DB with versioned collections and an alias
 - A scripted demo that exercises the full lifecycle
 
-## Architecture (plain English)
+## Architecture
 
-- The API creates a run record and sends a build task to DriftQ.
-- The worker pulls tasks from DriftQ, runs the pipeline steps, and ack/nackís messages.
-- Each build writes to a new Qdrant collection (versioned by number).
-- When a build succeeds, the worker updates the alias to point to the new collection.
-- Rollback just moves the alias back to an older collection.
+![DriftQ RAG demo flow](docs/flowchart.png)
+
+- Client/Demo calls the FastAPI service over HTTP to start builds, replay runs, or request rollback.
+- The API creates a run record in `/state`, then **produces** a message to DriftQ (it does not consume).
+- DriftQ holds the queue and handles redelivery. The worker **consumes** tasks, and then **acks or nacks** them.
+- The worker runs the pipeline steps (`discover -> chunk -> embed -> upsert -> promote -> smoketest`).
+- Each build writes vectors into a new Qdrant collection: `demo_<index>_v<version>`.
+- On success, the worker updates the Qdrant alias `demo_<index>_active` to point to the new collection.
+- Rollback is just another DriftQ task: the worker flips the alias back to a prior version.
 
 ## Prereqs
 
@@ -127,7 +131,7 @@ This demo shows how a failed build can be replayed safely. The scripted demo alw
 So you do not need Python or other local tools. The runner container calls the API and checks run status for you.
 
 **What if the demo waits forever for FAILED?**
-That usually means you already used the ìfail onceî and the run succeeded. Run `make down` to wipe volumes and try again.
+That usually means you already used the ‚Äúfail once‚Äù and the run succeeded. Run `make down` to wipe volumes and try again.
 
 **What is the data source?**
 Sample docs live under `data/docs/`. The pipeline reads these files and uses them to build embeddings.
@@ -163,6 +167,16 @@ make down
 
 ## Troubleshooting
 
+### Troubleshooting by symptom
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Demo waits for FAILED but keeps showing SUCCEEDED | The ‚Äúfail once‚Äù was already consumed or old state is reused | Run `make down`, then `make demo` |
+| `enqueue_failed` / 502 from `/demo/build` | DriftQ schema mismatch (produce payload rejected) | Pin `DRIFTQ_IMAGE` to a known compatible tag and rebuild |
+| Worker logs show `missing lease` | DriftQ consume response shape changed | Pin DriftQ image or adjust lease extraction in `api/app/driftq_client.py` |
+| `alias_target` is `null` right after rollback | Alias update race | Call `/demo/index/{index}` again after a few seconds |
+| Demo cannot reach API | Runner uses Docker network, not localhost | Ensure `API_BASE_URL=http://api:8000` in `demo` service |
+
 ### Demo cannot reach the API
 The demo runner talks to the API over the Docker network (for example, `http://api:8000`), not `localhost`. If you changed scripts, make sure they use `API_BASE_URL` and the `demo` service sets:
 
@@ -171,5 +185,15 @@ The demo runner talks to the API over the Docker network (for example, `http://a
 ### DriftQ topic-create errors
 DriftQ has had small schema differences across versions. If you see topic-create or produce errors, pin `DRIFTQ_IMAGE` to a known compatible tag in `.env` (instead of `:latest`).
 
-### ìExpected FAILED but got SUCCEEDEDî during demo
+### ‚ÄúExpected FAILED but got SUCCEEDED‚Äù during demo
 This usually means the failure was already consumed in a previous run or state was reused. Run `make down` to wipe volumes and try again.
+
+## How to extend this demo
+
+Here are a few simple ways to make this more real without making it complicated:
+
+- Replace `fake_embed()` with a real embedding model
+- Add auth and rate limits to the API
+- Add metrics (Prometheus) and traces (OpenTelemetry)
+- Add a second worker to see parallel consumption
+- Make the dataset larger and watch how batching affects Qdrant upserts
