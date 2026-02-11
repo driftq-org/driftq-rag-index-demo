@@ -1,4 +1,4 @@
-﻿# driftq-rag-index-demo
+# driftq-rag-index-demo
 
 This repo is a small, production-minded demo that shows how to:
 - use DriftQ-Core (via Docker) as a task queue + redelivery engine
@@ -35,14 +35,15 @@ It is designed to be easy to run locally. You do not need local Python or jq. Th
 ## Quick start
 
 ```bash
-cp .env.example .env
 make demo
 ```
+
+If `.env` is missing, `make demo` creates it from `.env.example` automatically.
+To customize values first, run `cp .env.example .env` and edit `.env`.
 
 No `make`? Use Docker directly:
 
 ```bash
-cp .env.example .env
 docker compose up --build --abort-on-container-exit --exit-code-from demo demo
 ```
 
@@ -131,7 +132,7 @@ This demo shows how a failed build can be replayed safely. The scripted demo alw
 So you do not need Python or other local tools. The runner container calls the API and checks run status for you.
 
 **What if the demo waits forever for FAILED?**
-That usually means you already used the “fail once” and the run succeeded. Run `make down` to wipe volumes and try again.
+That usually means you already used the �fail once� and the run succeeded. Run `make down` to wipe volumes and try again.
 
 **What is the data source?**
 Sample docs live under `data/docs/`. The pipeline reads these files and uses them to build embeddings.
@@ -171,7 +172,7 @@ make down
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| Demo waits for FAILED but keeps showing SUCCEEDED | The “fail once” was already consumed or old state is reused | Run `make down`, then `make demo` |
+| Demo waits for FAILED but keeps showing SUCCEEDED | The �fail once� was already consumed or old state is reused | Run `make down`, then `make demo` |
 | `enqueue_failed` / 502 from `/demo/build` | DriftQ schema mismatch (produce payload rejected) | Pin `DRIFTQ_IMAGE` to a known compatible tag and rebuild |
 | Worker logs show `missing lease` | DriftQ consume response shape changed | Pin DriftQ image or adjust lease extraction in `api/app/driftq_client.py` |
 | `alias_target` is `null` right after rollback | Alias update race | Call `/demo/index/{index}` again after a few seconds |
@@ -185,7 +186,7 @@ The demo runner talks to the API over the Docker network (for example, `http://a
 ### DriftQ topic-create errors
 DriftQ has had small schema differences across versions. If you see topic-create or produce errors, pin `DRIFTQ_IMAGE` to a known compatible tag in `.env` (instead of `:latest`).
 
-### “Expected FAILED but got SUCCEEDED” during demo
+### Expected FAILED but got SUCCEEDED during demo
 This usually means the failure was already consumed in a previous run or state was reused. Run `make down` to wipe volumes and try again.
 
 ## How to extend this demo

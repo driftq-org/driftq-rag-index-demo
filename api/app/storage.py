@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 STATE_ROOT = Path(os.getenv("DEMO_STATE_DIR", "/state"))
 

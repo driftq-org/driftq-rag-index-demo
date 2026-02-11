@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import json
-import os
-import random
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from .storage import run_dir, append_log, write_json, read_json
 
@@ -32,7 +28,11 @@ def load_docs(dataset: str) -> List[Dict[str, Any]]:
     root = Path("/data/docs")
     docs: List[Dict[str, Any]] = []
     for p in sorted(root.glob("*.md")):
-        docs.append({"doc_id": p.stem, "path": str(p), "text": p.read_text(encoding="utf-8")})
+        try:
+            text = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = p.read_text(encoding="cp1252")
+        docs.append({"doc_id": p.stem, "path": str(p), "text": text})
     if not docs:
         raise RuntimeError(f"No docs found in {root} (dataset={dataset})")
     return docs
